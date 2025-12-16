@@ -23,7 +23,7 @@ jobs:
       uses: softprops/action-gh-release@v2
       if: startsWith(github.ref, 'refs/tags/')
       with:
-        files: Flipper-Zero-PC-Monitor-USB-linux-x86_64
+        files: Flipper-Zero-PC-Monitor-USB-Linux-x86_64
 
   build-windows:
     runs-on: windows-latest
@@ -34,9 +34,9 @@ jobs:
     - name: Build
       run: cargo build --release
     - name: Move binary
-      run: mv target/release/flipper-pc-monitor-backend-usb.exe Flipper-Zero-PC-Monitor-USB-windows-x86_64.exe
+      run: mv target/release/flipper-pc-monitor-backend-usb.exe Flipper-Zero-PC-Monitor-USB-Windows-x86_64.exe
     - name: Upload release
       uses: softprops/action-gh-release@v2
       if: startsWith(github.ref, 'refs/tags/')
       with:
-        files: Flipper-Zero-PC-Monitor-USB-windows-x86_64.exe
+        files: Flipper-Zero-PC-Monitor-USB-Windows-x86_64.exe
