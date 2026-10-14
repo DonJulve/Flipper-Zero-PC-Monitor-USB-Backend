@@ -46,6 +46,15 @@ your-folder/
   pactl load-module module-null-sink sink_name=CABLE sink_properties=device.description=Virtual_CABLE
   ```
 
+## Hardware Monitoring Notes (Windows vs Linux)
+
+- **Linux**: Temperatures are read natively out-of-the-box from standard kernel hwmon interfaces (`/sys/class/hwmon`).
+- **Windows (CPU Temperature)**:
+  - Due to Windows architecture, accessing direct CPU core/package registers (MSR) requires Ring 0 kernel privileges with signed drivers.
+  - To view accurate real-time CPU & GPU temperatures, simply have [Libre Hardware Monitor](https://librehardwaremonitor.net/) (or [Open Hardware Monitor](https://openhardwaremonitor.org/)) running in the background. It is open-source, portable (no installation needed), and can be minimized to the system tray.
+  - The backend automatically connects to the Libre Hardware Monitor WMI service to retrieve dynamic temperatures.
+  - *If Libre Hardware Monitor is not open, all other telemetry (CPU %, RAM %, GPU %, VRAM %) and the soundboard will continue to work normally.*
+
 ## How to Run
 
 ### Using Pre-built Binaries

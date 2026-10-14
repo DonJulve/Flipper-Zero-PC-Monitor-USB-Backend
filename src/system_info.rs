@@ -77,31 +77,39 @@ impl SystemInfo {
         // Refresh only CPU usage before reading
         system_info.refresh_cpu_usage();
 
-        // CPU temperature via persistent sysinfo Components
-        // Rejects invalid readings (<= 15°C or >= 125°C) to prevent false 0°C on Windows WMI
+        // CPU temperature:
+        // On Windows: first check LibreHardwareMonitor / OpenHardwareMonitor via WMI if running in background.
+        // Fallback to sysinfo Components (which works natively on Linux).
+        #[cfg(target_os = "windows")]
+        let (cpu_temp_override, gpu_temp_override) = windows_hardware::get_lhm_temperatures();
+        #[cfg(not(target_os = "windows"))]
+        let (cpu_temp_override, gpu_temp_override): (Option<u8>, Option<u8>) = (None, None);
+
         components.refresh();
-        let cpu_temp: u8 = components
-            .iter()
-            .find(|c| {
-                let temp = c.temperature();
-                if temp <= 15.0 || temp >= 125.0 {
-                    return false;
-                }
-                let label = c.label().to_lowercase();
-                label.contains("package")
-                    || label.contains("cpu")
-                    || label.contains("tctl")
-                    || label.contains("tdie")
-                    || label.contains("core")
-                    || label.contains("k10temp")
-            })
-            .or_else(|| {
-                components
-                    .iter()
-                    .find(|c| c.temperature() > 15.0 && c.temperature() < 125.0)
-            })
-            .map(|c| c.temperature().round() as u8)
-            .unwrap_or(u8::MAX);
+        let cpu_temp: u8 = cpu_temp_override.unwrap_or_else(|| {
+            components
+                .iter()
+                .find(|c| {
+                    let temp = c.temperature();
+                    if temp <= 15.0 || temp >= 125.0 {
+                        return false;
+                    }
+                    let label = c.label().to_lowercase();
+                    label.contains("package")
+                        || label.contains("cpu")
+                        || label.contains("tctl")
+                        || label.contains("tdie")
+                        || label.contains("core")
+                        || label.contains("k10temp")
+                })
+                .or_else(|| {
+                    components
+                        .iter()
+                        .find(|c| c.temperature() > 15.0 && c.temperature() < 125.0)
+                })
+                .map(|c| c.temperature().round() as u8)
+                .unwrap_or(u8::MAX)
+        });
 
         SystemInfo {
             cpu_usage: avg_vecu32(
@@ -128,10 +136,9 @@ impl SystemInfo {
             },
             vram_unit: pop_4u8(Self::get_unit(vram_exp).as_bytes()),
             cpu_temp,
-            gpu_temp: match &gpu_info {
-                Some(gi) => gi.gpu_temp as u8,
-                None => u8::MAX,
-            },
+            gpu_temp: gpu_temp_override
+                .or_else(|| gpu_info.as_ref().map(|gi| gi.gpu_temp as u8))
+                .unwrap_or(u8::MAX),
         }
     }
 }
@@ -187,5 +194,77 @@ impl GpuInfo {
             }
             Err(_) => None,
         }
+    }
+}
+
+#[cfg(target_os = "windows")]
+mod windows_hardware {
+    use serde::Deserialize;
+    use wmi::{COMLibrary, WMIConnection};
+
+    #[derive(Deserialize, Debug)]
+    #[serde(rename = "Sensor")]
+    #[serde(rename_all = "PascalCase")]
+    #[allow(dead_code)]
+    struct HardwareSensor {
+        name: String,
+        sensor_type: String,
+        value: f32,
+    }
+
+    pub fn get_lhm_temperatures() -> (Option<u8>, Option<u8>) {
+        // Query LibreHardwareMonitor or OpenHardwareMonitor WMI namespace
+        let com_con = match COMLibrary::new() {
+            Ok(c) => c,
+            Err(_) => match COMLibrary::without_security() {
+                Ok(c) => c,
+                Err(_) => return (None, None),
+            },
+        };
+
+        let namespaces = ["ROOT\\LibreHardwareMonitor", "ROOT\\OpenHardwareMonitor"];
+        for ns in namespaces {
+            if let Ok(wmi_con) = WMIConnection::with_namespace_path(ns, com_con) {
+                let query = "SELECT Name, SensorType, Value FROM Sensor WHERE SensorType = 'Temperature'";
+                if let Ok(sensors) = wmi_con.raw_query::<HardwareSensor>(query) {
+                    if sensors.is_empty() {
+                        continue;
+                    }
+
+                    // Look for CPU Package / Core / CPU Total temperature
+                    let cpu_sensor = sensors.iter().find(|s| {
+                        let name = s.name.to_lowercase();
+                        (name.contains("package") || name.contains("tctl") || name.contains("cpu total"))
+                            && s.value > 15.0 && s.value < 115.0
+                    }).or_else(|| {
+                        sensors.iter().find(|s| {
+                            let name = s.name.to_lowercase();
+                            name.contains("cpu") && s.value > 15.0 && s.value < 115.0
+                        })
+                    });
+
+                    // Look for GPU Core temperature if available
+                    let gpu_sensor = sensors.iter().find(|s| {
+                        let name = s.name.to_lowercase();
+                        (name.contains("gpu core") || name.contains("gpu temperature"))
+                            && s.value > 15.0 && s.value < 115.0
+                    }).or_else(|| {
+                        sensors.iter().find(|s| {
+                            let name = s.name.to_lowercase();
+                            name.contains("gpu") && s.value > 15.0 && s.value < 115.0
+                        })
+                    });
+
+                    let cpu_temp = cpu_sensor.map(|s| s.value.round() as u8);
+                    let gpu_temp = gpu_sensor.map(|s| s.value.round() as u8);
+
+                    if cpu_temp.is_some() || gpu_temp.is_some() {
+                        return (cpu_temp, gpu_temp);
+                    }
+                }
+            }
+        }
+
+        (None, None)
     }
 }
