@@ -206,144 +206,278 @@ impl GpuInfo {
 
 #[cfg(target_os = "windows")]
 mod windows_hardware {
-    use serde::Deserialize;
-    use wmi::{COMLibrary, WMIConnection};
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use wmi::{COMLibrary, Variant, WMIConnection};
 
-    #[derive(Deserialize, Debug)]
-    #[serde(rename = "Sensor")]
-    #[serde(rename_all = "PascalCase")]
-    #[allow(dead_code)]
-    struct HardwareSensor {
-        name: String,
-        #[serde(default)]
-        identifier: String,
-        sensor_type: String,
-        value: f32,
+    type Row = HashMap<String, Variant>;
+
+    fn variant_f64(v: &Variant) -> Option<f64> {
+        Some(match v {
+            Variant::I1(x) => f64::from(*x),
+            Variant::I2(x) => f64::from(*x),
+            Variant::I4(x) => f64::from(*x),
+            Variant::I8(x) => *x as f64,
+            Variant::UI1(x) => f64::from(*x),
+            Variant::UI2(x) => f64::from(*x),
+            Variant::UI4(x) => f64::from(*x),
+            Variant::UI8(x) => *x as f64,
+            Variant::R4(x) => f64::from(*x),
+            Variant::R8(x) => *x,
+            Variant::String(s) => s.trim().parse().ok()?,
+            _ => return None,
+        })
     }
 
-    #[derive(Deserialize, Debug)]
-    #[serde(rename_all = "PascalCase")]
-    #[allow(dead_code)]
-    struct ThermalZonePerf {
-        #[serde(default)]
-        high_precision_temperature: Option<f32>,
-        #[serde(default)]
-        temperature: Option<f32>,
+    fn variant_string(v: &Variant) -> String {
+        match v {
+            Variant::String(s) => s.clone(),
+            _ => String::new(),
+        }
     }
 
-    #[derive(Deserialize, Debug)]
-    #[serde(rename_all = "PascalCase")]
-    #[allow(dead_code)]
-    struct AcpiThermalZone {
-        #[serde(default)]
-        current_temperature: Option<f32>,
-    }
-
-    fn plausible_temp(c: f32) -> bool {
+    fn plausible_temp(c: f64) -> bool {
         c.is_finite() && (5.0..=125.0).contains(&c)
     }
 
-    fn tenths_kelvin_to_c(v: f32) -> f32 {
+    fn tenths_kelvin_to_c(v: f64) -> f64 {
         v / 10.0 - 273.15
     }
 
-    pub fn get_windows_cpu_temp() -> (Option<u8>, Option<u8>) {
-        let com_con = match COMLibrary::new() {
-            Ok(c) => c,
-            Err(_) => match COMLibrary::without_security() {
-                Ok(c) => c,
-                Err(_) => return (None, None),
-            },
-        };
+    struct SensorData {
+        name: String,
+        identifier: String,
+        value: f64,
+    }
 
-        // Source 1: LibreHardwareMonitor / OpenHardwareMonitor WMI (CPU Package, Core Max, hottest CPU sensor)
-        let lhm_namespaces = ["ROOT\\LibreHardwareMonitor", "ROOT\\OpenHardwareMonitor"];
-        for ns in lhm_namespaces {
-            if let Ok(wmi_con) = WMIConnection::with_namespace_path(ns, com_con) {
-                let query = "SELECT Name, Identifier, SensorType, Value FROM Sensor WHERE SensorType = 'Temperature'";
-                if let Ok(sensors) = wmi_con.raw_query::<HardwareSensor>(query) {
-                    if !sensors.is_empty() {
-                        let temps: Vec<&HardwareSensor> = sensors
-                            .iter()
-                            .filter(|s| s.sensor_type.eq_ignore_ascii_case("Temperature") && plausible_temp(s.value))
-                            .collect();
+    pub struct WindowsHardwareMonitor {
+        com_lib: Option<COMLibrary>,
+        lhm_conn: Option<WMIConnection>,
+        ohm_conn: Option<WMIConnection>,
+        cimv2_conn: Option<WMIConnection>,
+        wmi_conn: Option<WMIConnection>,
+        last_logged: Option<String>,
+    }
 
-                        let is_cpu = |s: &HardwareSensor| {
-                            s.identifier.to_ascii_lowercase().contains("cpu")
-                                || s.name.to_ascii_lowercase().contains("cpu")
-                        };
+    impl WindowsHardwareMonitor {
+        fn new() -> Self {
+            let com_lib = COMLibrary::new().ok().or_else(|| COMLibrary::without_security().ok());
+            WindowsHardwareMonitor {
+                com_lib,
+                lhm_conn: None,
+                ohm_conn: None,
+                cimv2_conn: None,
+                wmi_conn: None,
+                last_logged: None,
+            }
+        }
 
-                        // 1. "CPU Package", else 2. "Core Max", else 3. hottest CPU sensor
-                        let cpu_sensor = temps
-                            .iter()
-                            .find(|s| s.name.eq_ignore_ascii_case("CPU Package") && is_cpu(s))
-                            .or_else(|| temps.iter().find(|s| s.name.eq_ignore_ascii_case("Core Max") && is_cpu(s)))
-                            .or_else(|| {
-                                temps
-                                    .iter()
-                                    .filter(|s| is_cpu(s))
-                                    .max_by(|a, b| a.value.partial_cmp(&b.value).unwrap_or(std::cmp::Ordering::Equal))
-                            });
+        fn get_com(&mut self) -> Option<COMLibrary> {
+            if self.com_lib.is_none() {
+                self.com_lib = COMLibrary::new().ok().or_else(|| COMLibrary::without_security().ok());
+            }
+            self.com_lib
+        }
 
-                        let cpu_temp = cpu_sensor.map(|s| s.value.round() as u8);
+        fn query_lhm_ns(&mut self, ns: &'static str, is_ohm: bool) -> Result<(Option<u8>, Option<u8>), String> {
+            let com = self.get_com().ok_or_else(|| "COM library initialization failed".to_string())?;
+            let conn = if is_ohm {
+                if self.ohm_conn.is_none() {
+                    self.ohm_conn = WMIConnection::with_namespace_path(ns, com).ok();
+                }
+                self.ohm_conn.as_ref()
+            } else {
+                if self.lhm_conn.is_none() {
+                    self.lhm_conn = WMIConnection::with_namespace_path(ns, com).ok();
+                }
+                self.lhm_conn.as_ref()
+            }.ok_or_else(|| format!("cannot connect to namespace {}", ns))?;
 
-                        // GPU temperature from LHM if available
-                        let is_gpu = |s: &HardwareSensor| {
-                            s.identifier.to_ascii_lowercase().contains("gpu")
-                                || s.name.to_ascii_lowercase().contains("gpu")
-                        };
-                        let gpu_sensor = temps
-                            .iter()
-                            .find(|s| s.name.eq_ignore_ascii_case("GPU Core") && is_gpu(s))
-                            .or_else(|| temps.iter().find(|s| is_gpu(s)));
-                        let gpu_temp = gpu_sensor.map(|s| s.value.round() as u8);
+            let query = "SELECT Name, Identifier, SensorType, Value FROM Sensor WHERE SensorType = 'Temperature'";
+            let rows: Vec<Row> = conn.raw_query(query).map_err(|e| {
+                if is_ohm { self.ohm_conn = None; } else { self.lhm_conn = None; }
+                format!("query failed: {e}")
+            })?;
 
-                        if cpu_temp.is_some() || gpu_temp.is_some() {
-                            return (cpu_temp, gpu_temp);
-                        }
+            if rows.is_empty() {
+                return Err("empty sensor list".to_string());
+            }
+
+            let sensors: Vec<SensorData> = rows
+                .iter()
+                .filter_map(|r| {
+                    let val = variant_f64(r.get("Value")?)?;
+                    if !plausible_temp(val) {
+                        return None;
                     }
-                }
-            }
-        }
-
-        // Source 2: Win32_PerfFormattedData_Counters_ThermalZoneInformation (ROOT\CIMV2)
-        if let Ok(wmi_con) = WMIConnection::with_namespace_path("ROOT\\CIMV2", com_con) {
-            let query = "SELECT HighPrecisionTemperature, Temperature FROM Win32_PerfFormattedData_Counters_ThermalZoneInformation";
-            if let Ok(rows) = wmi_con.raw_query::<ThermalZonePerf>(query) {
-                let best = rows
-                    .iter()
-                    .filter_map(|r| {
-                        r.high_precision_temperature
-                            .filter(|&v| v > 0.0)
-                            .or_else(|| r.temperature.map(|k| k * 10.0))
+                    Some(SensorData {
+                        name: r.get("Name").map(variant_string).unwrap_or_default(),
+                        identifier: r.get("Identifier").map(variant_string).unwrap_or_default(),
+                        value: val,
                     })
-                    .map(tenths_kelvin_to_c)
-                    .filter(|&c| plausible_temp(c))
-                    .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                })
+                .collect();
 
-                if let Some(c) = best {
-                    return (Some(c.round() as u8), None);
-                }
+            if sensors.is_empty() {
+                return Err("no plausible temperature sensors found".to_string());
+            }
+
+            let is_cpu = |s: &SensorData| {
+                s.identifier.to_ascii_lowercase().contains("cpu")
+                    || s.name.to_ascii_lowercase().contains("cpu")
+            };
+
+            // Order: "CPU Package" > "Core Max" > "Core (Tctl/Tdie)" > hottest CPU sensor
+            let cpu_sensor = sensors
+                .iter()
+                .find(|s| s.name.eq_ignore_ascii_case("CPU Package") && is_cpu(s))
+                .or_else(|| sensors.iter().find(|s| s.name.eq_ignore_ascii_case("Core Max") && is_cpu(s)))
+                .or_else(|| sensors.iter().find(|s| s.name.to_ascii_lowercase().contains("tctl") && is_cpu(s)))
+                .or_else(|| {
+                    sensors
+                        .iter()
+                        .filter(|s| is_cpu(s))
+                        .max_by(|a, b| a.value.partial_cmp(&b.value).unwrap_or(std::cmp::Ordering::Equal))
+                });
+
+            let is_gpu = |s: &SensorData| {
+                s.identifier.to_ascii_lowercase().contains("gpu")
+                    || s.name.to_ascii_lowercase().contains("gpu")
+            };
+            let gpu_sensor = sensors
+                .iter()
+                .find(|s| s.name.eq_ignore_ascii_case("GPU Core") && is_gpu(s))
+                .or_else(|| sensors.iter().find(|s| is_gpu(s)));
+
+            let cpu_temp = cpu_sensor.map(|s| s.value.round() as u8);
+            let gpu_temp = gpu_sensor.map(|s| s.value.round() as u8);
+
+            if cpu_temp.is_some() || gpu_temp.is_some() {
+                Ok((cpu_temp, gpu_temp))
+            } else {
+                Err("no CPU or GPU temperature identified".to_string())
             }
         }
 
-        // Source 3: MSAcpi_ThermalZoneTemperature (ROOT\WMI)
-        if let Ok(wmi_con) = WMIConnection::with_namespace_path("ROOT\\WMI", com_con) {
+        fn query_thermal_zone_perf(&mut self) -> Result<Option<u8>, String> {
+            let com = self.get_com().ok_or_else(|| "COM library initialization failed".to_string())?;
+            if self.cimv2_conn.is_none() {
+                self.cimv2_conn = WMIConnection::with_namespace_path("ROOT\\CIMV2", com).ok();
+            }
+            let conn = self.cimv2_conn.as_ref().ok_or_else(|| "cannot connect to ROOT\\CIMV2".to_string())?;
+
+            let query = "SELECT HighPrecisionTemperature, Temperature FROM Win32_PerfFormattedData_Counters_ThermalZoneInformation";
+            let rows: Vec<Row> = conn.raw_query(query).map_err(|e| {
+                self.cimv2_conn = None;
+                format!("query failed: {e}")
+            })?;
+
+            let best = rows
+                .iter()
+                .filter_map(|r| {
+                    r.get("HighPrecisionTemperature")
+                        .and_then(variant_f64)
+                        .filter(|&v| v > 0.0)
+                        .or_else(|| r.get("Temperature").and_then(variant_f64).map(|k| k * 10.0))
+                })
+                .map(tenths_kelvin_to_c)
+                .filter(|&c| plausible_temp(c))
+                .max_by(|a, b| a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal));
+
+            Ok(best.map(|c| c.round() as u8))
+        }
+
+        fn query_acpi_thermal_zone(&mut self) -> Result<Option<u8>, String> {
+            let com = self.get_com().ok_or_else(|| "COM library initialization failed".to_string())?;
+            if self.wmi_conn.is_none() {
+                self.wmi_conn = WMIConnection::with_namespace_path("ROOT\\WMI", com).ok();
+            }
+            let conn = self.wmi_conn.as_ref().ok_or_else(|| "cannot connect to ROOT\\WMI".to_string())?;
+
             let query = "SELECT CurrentTemperature FROM MSAcpi_ThermalZoneTemperature";
-            if let Ok(rows) = wmi_con.raw_query::<AcpiThermalZone>(query) {
-                let best = rows
-                    .iter()
-                    .filter_map(|r| r.current_temperature)
-                    .map(tenths_kelvin_to_c)
-                    .filter(|&c| plausible_temp(c))
-                    .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let rows: Vec<Row> = conn.raw_query(query).map_err(|e| {
+                self.wmi_conn = None;
+                format!("query failed: {e}")
+            })?;
 
-                if let Some(c) = best {
-                    return (Some(c.round() as u8), None);
-                }
-            }
+            let best = rows
+                .iter()
+                .filter_map(|r| r.get("CurrentTemperature").and_then(variant_f64))
+                .map(tenths_kelvin_to_c)
+                .filter(|&c| plausible_temp(c))
+                .max_by(|a, b| a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal));
+
+            Ok(best.map(|c| c.round() as u8))
         }
 
-        (None, None)
+        pub fn read(&mut self) -> (Option<u8>, Option<u8>) {
+            // Source 1: LibreHardwareMonitor
+            match self.query_lhm_ns("ROOT\\LibreHardwareMonitor", false) {
+                Ok((cpu, gpu)) => {
+                    let msg = "LibreHardwareMonitor WMI";
+                    if self.last_logged.as_deref() != Some(msg) {
+                        println!("[Hardware Monitor] CPU Temp source: {} (CPU: {:?}°C, GPU: {:?}°C)", msg, cpu, gpu);
+                        self.last_logged = Some(msg.to_string());
+                    }
+                    return (cpu, gpu);
+                }
+                Err(_) => {}
+            }
+
+            // Source 2: OpenHardwareMonitor
+            match self.query_lhm_ns("ROOT\\OpenHardwareMonitor", true) {
+                Ok((cpu, gpu)) => {
+                    let msg = "OpenHardwareMonitor WMI";
+                    if self.last_logged.as_deref() != Some(msg) {
+                        println!("[Hardware Monitor] CPU Temp source: {} (CPU: {:?}°C, GPU: {:?}°C)", msg, cpu, gpu);
+                        self.last_logged = Some(msg.to_string());
+                    }
+                    return (cpu, gpu);
+                }
+                Err(_) => {}
+            }
+
+            // Source 3: ThermalZoneInformation perf counter (ROOT\CIMV2)
+            match self.query_thermal_zone_perf() {
+                Ok(Some(cpu)) => {
+                    let msg = "Win32_PerfFormattedData ThermalZone";
+                    if self.last_logged.as_deref() != Some(msg) {
+                        println!("[Hardware Monitor] CPU Temp source: {} (CPU: {}°C)", msg, cpu);
+                        self.last_logged = Some(msg.to_string());
+                    }
+                    return (Some(cpu), None);
+                }
+                _ => {}
+            }
+
+            // Source 4: MSAcpi_ThermalZoneTemperature (ROOT\WMI)
+            match self.query_acpi_thermal_zone() {
+                Ok(Some(cpu)) => {
+                    let msg = "MSAcpi_ThermalZoneTemperature";
+                    if self.last_logged.as_deref() != Some(msg) {
+                        println!("[Hardware Monitor] CPU Temp source: {} (CPU: {}°C)", msg, cpu);
+                        self.last_logged = Some(msg.to_string());
+                    }
+                    return (Some(cpu), None);
+                }
+                _ => {}
+            }
+
+            if self.last_logged.as_deref() != Some("None") {
+                println!("[Hardware Monitor] Aviso: No se detectó ninguna fuente de temperatura en Windows.");
+                println!("  -> Si usas Libre Hardware Monitor, ábrelo y verifica que 'Options -> WMI' esté activado.");
+                self.last_logged = Some("None".to_string());
+            }
+
+            (None, None)
+        }
+    }
+
+    thread_local! {
+        static MONITOR: RefCell<WindowsHardwareMonitor> = RefCell::new(WindowsHardwareMonitor::new());
+    }
+
+    pub fn get_windows_cpu_temp() -> (Option<u8>, Option<u8>) {
+        MONITOR.with(|m| m.borrow_mut().read())
     }
 }
