@@ -78,37 +78,44 @@ impl SystemInfo {
         system_info.refresh_cpu_usage();
 
         // CPU temperature:
-        // On Windows: first check LibreHardwareMonitor / OpenHardwareMonitor via WMI if running in background.
-        // Fallback to sysinfo Components (which works natively on Linux).
+        // Sources prioritized:
+        // 1. LibreHardwareMonitor / OpenHardwareMonitor WMI (CPU Package, Core Max, hottest CPU sensor)
+        // 2. Win32_PerfFormattedData_Counters_ThermalZoneInformation (ROOT\CIMV2)
+        // 3. MSAcpi_ThermalZoneTemperature (ROOT\WMI)
+        // Fallback to sysinfo Components with prioritized picking (works natively on Linux).
         #[cfg(target_os = "windows")]
-        let (cpu_temp_override, gpu_temp_override) = windows_hardware::get_lhm_temperatures();
+        let (cpu_temp_override, gpu_temp_override) = windows_hardware::get_windows_cpu_temp();
         #[cfg(not(target_os = "windows"))]
         let (cpu_temp_override, gpu_temp_override): (Option<u8>, Option<u8>) = (None, None);
 
         components.refresh();
         let cpu_temp: u8 = cpu_temp_override.unwrap_or_else(|| {
-            components
-                .iter()
-                .find(|c| {
-                    let temp = c.temperature();
-                    if temp <= 15.0 || temp >= 125.0 {
-                        return false;
-                    }
-                    let label = c.label().to_lowercase();
-                    label.contains("package")
-                        || label.contains("cpu")
-                        || label.contains("tctl")
-                        || label.contains("tdie")
-                        || label.contains("core")
-                        || label.contains("k10temp")
-                })
-                .or_else(|| {
-                    components
-                        .iter()
-                        .find(|c| c.temperature() > 15.0 && c.temperature() < 125.0)
-                })
-                .map(|c| c.temperature().round() as u8)
-                .unwrap_or(u8::MAX)
+            // Prioritized picking:
+            // Priority 3: package, tctl, tdie
+            // Priority 2: coretemp, k10temp, cpu
+            // Priority 1: core
+            let mut best: Option<(u8, f32)> = None;
+            for c in components.iter() {
+                let temp = c.temperature();
+                if !(5.0..=125.0).contains(&temp) {
+                    continue;
+                }
+                let l = c.label().to_ascii_lowercase();
+                let prio = if l.contains("package") || l.contains("tctl") || l.contains("tdie") {
+                    3
+                } else if l.contains("coretemp") || l.contains("k10temp") || l.contains("cpu") {
+                    2
+                } else if l.contains("core") {
+                    1
+                } else {
+                    continue;
+                };
+                best = match best {
+                    Some((p, v)) if p > prio || (p == prio && v >= temp) => Some((p, v)),
+                    _ => Some((prio, temp)),
+                };
+            }
+            best.map(|(_, t)| t.round() as u8).unwrap_or(u8::MAX)
         });
 
         SystemInfo {
@@ -208,12 +215,39 @@ mod windows_hardware {
     #[allow(dead_code)]
     struct HardwareSensor {
         name: String,
+        #[serde(default)]
+        identifier: String,
         sensor_type: String,
         value: f32,
     }
 
-    pub fn get_lhm_temperatures() -> (Option<u8>, Option<u8>) {
-        // Query LibreHardwareMonitor or OpenHardwareMonitor WMI namespace
+    #[derive(Deserialize, Debug)]
+    #[serde(rename_all = "PascalCase")]
+    #[allow(dead_code)]
+    struct ThermalZonePerf {
+        #[serde(default)]
+        high_precision_temperature: Option<f32>,
+        #[serde(default)]
+        temperature: Option<f32>,
+    }
+
+    #[derive(Deserialize, Debug)]
+    #[serde(rename_all = "PascalCase")]
+    #[allow(dead_code)]
+    struct AcpiThermalZone {
+        #[serde(default)]
+        current_temperature: Option<f32>,
+    }
+
+    fn plausible_temp(c: f32) -> bool {
+        c.is_finite() && (5.0..=125.0).contains(&c)
+    }
+
+    fn tenths_kelvin_to_c(v: f32) -> f32 {
+        v / 10.0 - 273.15
+    }
+
+    pub fn get_windows_cpu_temp() -> (Option<u8>, Option<u8>) {
         let com_con = match COMLibrary::new() {
             Ok(c) => c,
             Err(_) => match COMLibrary::without_security() {
@@ -222,45 +256,90 @@ mod windows_hardware {
             },
         };
 
-        let namespaces = ["ROOT\\LibreHardwareMonitor", "ROOT\\OpenHardwareMonitor"];
-        for ns in namespaces {
+        // Source 1: LibreHardwareMonitor / OpenHardwareMonitor WMI (CPU Package, Core Max, hottest CPU sensor)
+        let lhm_namespaces = ["ROOT\\LibreHardwareMonitor", "ROOT\\OpenHardwareMonitor"];
+        for ns in lhm_namespaces {
             if let Ok(wmi_con) = WMIConnection::with_namespace_path(ns, com_con) {
-                let query = "SELECT Name, SensorType, Value FROM Sensor WHERE SensorType = 'Temperature'";
+                let query = "SELECT Name, Identifier, SensorType, Value FROM Sensor WHERE SensorType = 'Temperature'";
                 if let Ok(sensors) = wmi_con.raw_query::<HardwareSensor>(query) {
-                    if sensors.is_empty() {
-                        continue;
+                    if !sensors.is_empty() {
+                        let temps: Vec<&HardwareSensor> = sensors
+                            .iter()
+                            .filter(|s| s.sensor_type.eq_ignore_ascii_case("Temperature") && plausible_temp(s.value))
+                            .collect();
+
+                        let is_cpu = |s: &HardwareSensor| {
+                            s.identifier.to_ascii_lowercase().contains("cpu")
+                                || s.name.to_ascii_lowercase().contains("cpu")
+                        };
+
+                        // 1. "CPU Package", else 2. "Core Max", else 3. hottest CPU sensor
+                        let cpu_sensor = temps
+                            .iter()
+                            .find(|s| s.name.eq_ignore_ascii_case("CPU Package") && is_cpu(s))
+                            .or_else(|| temps.iter().find(|s| s.name.eq_ignore_ascii_case("Core Max") && is_cpu(s)))
+                            .or_else(|| {
+                                temps
+                                    .iter()
+                                    .filter(|s| is_cpu(s))
+                                    .max_by(|a, b| a.value.partial_cmp(&b.value).unwrap_or(std::cmp::Ordering::Equal))
+                            });
+
+                        let cpu_temp = cpu_sensor.map(|s| s.value.round() as u8);
+
+                        // GPU temperature from LHM if available
+                        let is_gpu = |s: &HardwareSensor| {
+                            s.identifier.to_ascii_lowercase().contains("gpu")
+                                || s.name.to_ascii_lowercase().contains("gpu")
+                        };
+                        let gpu_sensor = temps
+                            .iter()
+                            .find(|s| s.name.eq_ignore_ascii_case("GPU Core") && is_gpu(s))
+                            .or_else(|| temps.iter().find(|s| is_gpu(s)));
+                        let gpu_temp = gpu_sensor.map(|s| s.value.round() as u8);
+
+                        if cpu_temp.is_some() || gpu_temp.is_some() {
+                            return (cpu_temp, gpu_temp);
+                        }
                     }
+                }
+            }
+        }
 
-                    // Look for CPU Package / Core / CPU Total temperature
-                    let cpu_sensor = sensors.iter().find(|s| {
-                        let name = s.name.to_lowercase();
-                        (name.contains("package") || name.contains("tctl") || name.contains("cpu total"))
-                            && s.value > 15.0 && s.value < 115.0
-                    }).or_else(|| {
-                        sensors.iter().find(|s| {
-                            let name = s.name.to_lowercase();
-                            name.contains("cpu") && s.value > 15.0 && s.value < 115.0
-                        })
-                    });
+        // Source 2: Win32_PerfFormattedData_Counters_ThermalZoneInformation (ROOT\CIMV2)
+        if let Ok(wmi_con) = WMIConnection::with_namespace_path("ROOT\\CIMV2", com_con) {
+            let query = "SELECT HighPrecisionTemperature, Temperature FROM Win32_PerfFormattedData_Counters_ThermalZoneInformation";
+            if let Ok(rows) = wmi_con.raw_query::<ThermalZonePerf>(query) {
+                let best = rows
+                    .iter()
+                    .filter_map(|r| {
+                        r.high_precision_temperature
+                            .filter(|&v| v > 0.0)
+                            .or_else(|| r.temperature.map(|k| k * 10.0))
+                    })
+                    .map(tenths_kelvin_to_c)
+                    .filter(|&c| plausible_temp(c))
+                    .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-                    // Look for GPU Core temperature if available
-                    let gpu_sensor = sensors.iter().find(|s| {
-                        let name = s.name.to_lowercase();
-                        (name.contains("gpu core") || name.contains("gpu temperature"))
-                            && s.value > 15.0 && s.value < 115.0
-                    }).or_else(|| {
-                        sensors.iter().find(|s| {
-                            let name = s.name.to_lowercase();
-                            name.contains("gpu") && s.value > 15.0 && s.value < 115.0
-                        })
-                    });
+                if let Some(c) = best {
+                    return (Some(c.round() as u8), None);
+                }
+            }
+        }
 
-                    let cpu_temp = cpu_sensor.map(|s| s.value.round() as u8);
-                    let gpu_temp = gpu_sensor.map(|s| s.value.round() as u8);
+        // Source 3: MSAcpi_ThermalZoneTemperature (ROOT\WMI)
+        if let Ok(wmi_con) = WMIConnection::with_namespace_path("ROOT\\WMI", com_con) {
+            let query = "SELECT CurrentTemperature FROM MSAcpi_ThermalZoneTemperature";
+            if let Ok(rows) = wmi_con.raw_query::<AcpiThermalZone>(query) {
+                let best = rows
+                    .iter()
+                    .filter_map(|r| r.current_temperature)
+                    .map(tenths_kelvin_to_c)
+                    .filter(|&c| plausible_temp(c))
+                    .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-                    if cpu_temp.is_some() || gpu_temp.is_some() {
-                        return (cpu_temp, gpu_temp);
-                    }
+                if let Some(c) = best {
+                    return (Some(c.round() as u8), None);
                 }
             }
         }
