@@ -66,11 +66,11 @@ fn main() {
     // 1. INICIALIZAR AUDIO PRINCIPAL (Auriculares / Altavoces)
     let (_default_stream, default_handle) = match OutputStream::try_default() {
         Ok(res) => {
-            println!("🎧 Audio local: Conectado (Tú escucharás los sonidos).");
+            println!("Audio local: Conectado (Tú escucharás los sonidos).");
             res
         }
         Err(e) => {
-            eprintln!("⚠️ No se pudo inicializar audio por defecto: {}", e);
+            eprintln!("No se pudo inicializar audio por defecto: {}", e);
             // Salir o continuar sin sonido si falla el driver
             std::process::exit(1);
         }
@@ -86,7 +86,7 @@ fn main() {
         for device in devices {
             if let Ok(name) = device.name() {
                 if name.to_uppercase().contains("CABLE") {
-                    println!("🎤 Cable Virtual detectado: {}", name);
+                    println!("Cable Virtual detectado: {}", name);
                     virtual_device = Some(device);
                     break;
                 }
@@ -98,13 +98,14 @@ fn main() {
         if let Ok((stream, handle)) = OutputStream::try_from_device(&device) {
             _virtual_stream = Some(stream);
             virtual_handle = Some(handle);
-            println!("✅ Audio Virtual: Conectado (Tus amigos en Discord escucharán los sonidos).");
+            println!("Audio Virtual: Conectado (Tus amigos en Discord escucharán los sonidos).");
         }
     } else {
-        println!("ℹNo se detectó Cable Virtual (VB-Cable). Los sonidos solo se escucharán localmente.");
+        println!("No se detectó Cable Virtual (VB-Cable). Los sonidos solo se escucharán localmente.");
     }
 
     let mut system_info = System::new_all();
+    let mut components = sysinfo::Components::new_with_refreshed_list();
     let mut serial_buf: Vec<u8> = vec![0; 128];
     let mut text_buffer = String::new();
 
@@ -147,7 +148,10 @@ fn main() {
                         // 1. MANDAR DATOS AL FLIPPER CADA 1 SEGUNDO (Telemetría de PC)
                         if first_run || last_update_time.elapsed() >= Duration::from_secs(1) {
                             first_run = false;
-                            let info = system_info::SystemInfo::get_system_info(&mut system_info);
+                            let info = system_info::SystemInfo::get_system_info(
+                                &mut system_info,
+                                &mut components,
+                            );
                             let data = bincode::serialize(&info).unwrap();
 
                             match port.write_all(&data) {

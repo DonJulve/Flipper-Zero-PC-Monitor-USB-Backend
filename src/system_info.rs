@@ -1,6 +1,6 @@
 use crate::helpers::{avg_vecu32, nvd_r2u64, pop_4u8};
 use serde::Serialize;
-use sysinfo::{Components, MemoryRefreshKind};
+use sysinfo::MemoryRefreshKind;
 
 
 /*
@@ -53,7 +53,10 @@ impl SystemInfo {
         }
     }
 
-    pub fn get_system_info(system_info: &mut sysinfo::System) -> Self {
+    pub fn get_system_info(
+        system_info: &mut sysinfo::System,
+        components: &mut sysinfo::Components,
+    ) -> Self {
         // Need to refresh only CPU and RAM => big boost when combined with reusing system_info
         // system_info.refresh_all();
         system_info.refresh_memory_specifics(MemoryRefreshKind::new().with_ram());
@@ -74,25 +77,31 @@ impl SystemInfo {
         // Refresh only CPU usage before reading
         system_info.refresh_cpu_usage();
 
-        // CPU temperature via sysinfo Components
-        // Matches Intel (Package, core), AMD Ryzen (Tctl, Tdie, k10temp), and falls back to first component
-        let cpu_temp: u8 = {
-            let components = Components::new_with_refreshed_list();
-            components
-                .iter()
-                .find(|c| {
-                    let label = c.label().to_lowercase();
-                    label.contains("package")
-                        || label.contains("cpu")
-                        || label.contains("tctl")
-                        || label.contains("tdie")
-                        || label.contains("core")
-                        || label.contains("k10temp")
-                })
-                .or_else(|| components.first())
-                .map(|c| c.temperature().max(0.0) as u8)
-                .unwrap_or(u8::MAX)
-        };
+        // CPU temperature via persistent sysinfo Components
+        // Rejects invalid readings (<= 15°C or >= 125°C) to prevent false 0°C on Windows WMI
+        components.refresh();
+        let cpu_temp: u8 = components
+            .iter()
+            .find(|c| {
+                let temp = c.temperature();
+                if temp <= 15.0 || temp >= 125.0 {
+                    return false;
+                }
+                let label = c.label().to_lowercase();
+                label.contains("package")
+                    || label.contains("cpu")
+                    || label.contains("tctl")
+                    || label.contains("tdie")
+                    || label.contains("core")
+                    || label.contains("k10temp")
+            })
+            .or_else(|| {
+                components
+                    .iter()
+                    .find(|c| c.temperature() > 15.0 && c.temperature() < 125.0)
+            })
+            .map(|c| c.temperature().round() as u8)
+            .unwrap_or(u8::MAX);
 
         SystemInfo {
             cpu_usage: avg_vecu32(
