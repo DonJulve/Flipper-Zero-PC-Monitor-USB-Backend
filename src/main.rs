@@ -55,6 +55,8 @@ fn main() {
                         //     uint16_t vram_max;
                         //     uint8_t vram_usage;
                         //     char vram_unit[4];
+                        //     uint8_t cpu_temp;
+                        //     uint8_t gpu_temp;
                         // } DataStruct;
                         
                         // We use bincode or manual packing. SystemInfo struct in system_info.rs is:
@@ -68,6 +70,8 @@ fn main() {
                             pub vram_max: u16,
                             pub vram_usage: u8,
                             pub vram_unit: [u8; 4],
+                            pub cpu_temp: u8,
+                            pub gpu_temp: u8,
                         }
                         */
                         // Since SystemInfo uses u8 for fields, and [u8;4] for arrays, AND it derives Serialize.
@@ -95,7 +99,32 @@ fn main() {
                     }
                 },
                 Err(e) => {
-                    println!("Failed to open serial port: {}", e);
+                    let err_str = e.to_string();
+                    // "Device or resource busy" on Linux, "Access is denied" on Windows
+                    let is_busy = err_str.to_lowercase().contains("busy")
+                        || err_str.to_lowercase().contains("access is denied");
+
+                    if is_busy {
+                        println!(
+                            "Port {} is busy — another process has it open.",
+                            port_name
+                        );
+                        #[cfg(target_os = "linux")]
+                        println!(
+                            "  -> Run:  sudo fuser -k {}  (kills whichever process holds it)",
+                            port_name
+                        );
+                        #[cfg(target_os = "windows")]
+                        println!(
+                            "  -> Close qFlipper, any serial terminal, or Device Manager view\
+                             that may have the port open."
+                        );
+                        println!("  -> Then restart this backend.");
+                        // No point hammering the port if it is busy; exit so the user can fix it.
+                        std::process::exit(1);
+                    } else {
+                        println!("Failed to open serial port: {}", e);
+                    }
                 }
             }
         } else {

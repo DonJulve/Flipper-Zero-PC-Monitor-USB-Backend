@@ -1,6 +1,6 @@
 use crate::helpers::{avg_vecu32, nvd_r2u64, pop_4u8};
 use serde::Serialize;
-use sysinfo::MemoryRefreshKind;
+use sysinfo::{Components, MemoryRefreshKind};
 
 
 /*
@@ -26,6 +26,8 @@ pub struct SystemInfo {
     pub vram_max: u16,
     pub vram_usage: u8,
     pub vram_unit: [u8; 4],
+    pub cpu_temp: u8,   // degrees C, 255 = N/A
+    pub gpu_temp: u8,   // degrees C, 255 = N/A
 }
 
 impl SystemInfo {
@@ -71,6 +73,27 @@ impl SystemInfo {
 
         // Refresh only CPU usage before reading
         system_info.refresh_cpu_usage();
+
+        // CPU temperature via sysinfo Components
+        // Matches Intel (Package, core), AMD Ryzen (Tctl, Tdie, k10temp), and falls back to first component
+        let cpu_temp: u8 = {
+            let components = Components::new_with_refreshed_list();
+            components
+                .iter()
+                .find(|c| {
+                    let label = c.label().to_lowercase();
+                    label.contains("package")
+                        || label.contains("cpu")
+                        || label.contains("tctl")
+                        || label.contains("tdie")
+                        || label.contains("core")
+                        || label.contains("k10temp")
+                })
+                .or_else(|| components.first())
+                .map(|c| c.temperature().max(0.0) as u8)
+                .unwrap_or(u8::MAX)
+        };
+
         SystemInfo {
             cpu_usage: avg_vecu32(
                 system_info
@@ -95,6 +118,11 @@ impl SystemInfo {
                 None => u8::MAX,
             },
             vram_unit: pop_4u8(Self::get_unit(vram_exp).as_bytes()),
+            cpu_temp,
+            gpu_temp: match &gpu_info {
+                Some(gi) => gi.gpu_temp as u8,
+                None => u8::MAX,
+            },
         }
     }
 }
@@ -104,6 +132,7 @@ pub struct GpuInfo {
     pub gpu_usage: u64,
     pub vram_max: u64,
     pub vram_used: u64,
+    pub gpu_temp: u64,  // degrees C, 0 = N/A
 }
 
 impl GpuInfo {
@@ -137,11 +166,14 @@ impl GpuInfo {
                 let Some(vram_used) = nvd_r2u64(g["fb_memory_usage"]["used"].to_string()) else {
                     return None;
                 };
+                // gpu_temp may be absent on some cards, default to 0
+                let gpu_temp = nvd_r2u64(g["temperature"]["gpu_temp"].to_string()).unwrap_or(0);
 
                 Some(GpuInfo {
                     gpu_usage,
                     vram_max,
                     vram_used,
+                    gpu_temp,
                 })
             }
             Err(_) => None,
