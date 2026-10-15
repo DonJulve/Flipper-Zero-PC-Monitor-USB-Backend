@@ -324,6 +324,7 @@ dependencies = [
  "bincode",
  "rodio",
  "serde",
+ "serde_json",
  "serialport",
  "sysinfo",
  "wmi",

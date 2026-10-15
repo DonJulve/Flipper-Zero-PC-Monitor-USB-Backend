@@ -410,8 +410,106 @@ mod windows_hardware {
             Ok(best.map(|c| c.round() as u8))
         }
 
+        fn query_lhm_http(&self) -> Result<(Option<u8>, Option<u8>), String> {
+            use std::io::{Read, Write};
+            use std::net::TcpStream;
+            use std::time::Duration;
+
+            let addr = "127.0.0.1:8085".parse().map_err(|e| format!("{e}"))?;
+            let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(50))
+                .map_err(|e| format!("connection to 127.0.0.1:8085 failed: {e}"))?;
+            stream.set_read_timeout(Some(Duration::from_millis(150))).ok();
+            stream.write_all(b"GET /data.json HTTP/1.1\r\nHost: 127.0.0.1:8085\r\nConnection: close\r\n\r\n")
+                .map_err(|e| format!("write failed: {e}"))?;
+
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).map_err(|e| format!("read failed: {e}"))?;
+
+            let resp_str = String::from_utf8_lossy(&response);
+            let json_start = resp_str.find("\r\n\r\n").ok_or_else(|| "no HTTP body".to_string())?;
+            let json_body = &resp_str[json_start + 4..];
+
+            let val: serde_json::Value = serde_json::from_str(json_body)
+                .map_err(|e| format!("JSON parse failed: {e}"))?;
+
+            let mut cpu_temp: Option<u8> = None;
+            let mut gpu_temp: Option<u8> = None;
+
+            fn parse_temp_val(v_str: &str) -> Option<u8> {
+                let num_part = v_str.split_whitespace().next()?;
+                let num_clean = num_part.replace(',', ".");
+                let val: f32 = num_clean.parse().ok()?;
+                if val > 15.0 && val < 115.0 {
+                    Some(val.round() as u8)
+                } else {
+                    None
+                }
+            }
+
+            fn walk_node(
+                node: &serde_json::Value,
+                cpu_temp: &mut Option<u8>,
+                gpu_temp: &mut Option<u8>,
+                is_in_cpu: bool,
+                is_in_gpu: bool,
+            ) {
+                let text = node["Text"].as_str().unwrap_or("");
+                let lower = text.to_lowercase();
+
+                let in_cpu = is_in_cpu || lower.contains("cpu") || lower.contains("ryzen") || lower.contains("core");
+                let in_gpu = is_in_gpu || lower.contains("gpu") || lower.contains("nvidia") || lower.contains("radeon") || lower.contains("geforce");
+
+                if let Some(val_str) = node["Value"].as_str() {
+                    if val_str.contains("°C") || val_str.contains("C") {
+                        if in_cpu && cpu_temp.is_none() {
+                            if lower.contains("package")
+                                || lower.contains("core max")
+                                || lower.contains("tctl")
+                                || lower.contains("total")
+                                || lower.contains("cpu")
+                            {
+                                *cpu_temp = parse_temp_val(val_str);
+                            }
+                        }
+                        if in_gpu && gpu_temp.is_none() {
+                            if lower.contains("core") || lower.contains("gpu") {
+                                *gpu_temp = parse_temp_val(val_str);
+                            }
+                        }
+                    }
+                }
+
+                if let Some(children) = node["Children"].as_array() {
+                    for child in children {
+                        walk_node(child, cpu_temp, gpu_temp, in_cpu, in_gpu);
+                    }
+                }
+            }
+
+            walk_node(&val, &mut cpu_temp, &mut gpu_temp, false, false);
+
+            if cpu_temp.is_some() || gpu_temp.is_some() {
+                Ok((cpu_temp, gpu_temp))
+            } else {
+                Err("no CPU or GPU temperature found in JSON".to_string())
+            }
+        }
+
         pub fn read(&mut self) -> (Option<u8>, Option<u8>) {
-            // Source 1: LibreHardwareMonitor
+            // Source 0: LibreHardwareMonitor HTTP Web Server (Options -> Remote Web Server -> Run on port 8085)
+            match self.query_lhm_http() {
+                Ok((cpu, gpu)) => {
+                    let msg = "LibreHardwareMonitor Web Server (http://localhost:8085)";
+                    if self.last_logged.as_deref() != Some(msg) {
+                        println!("[Hardware Monitor] CPU Temp source: {} (CPU: {:?}°C, GPU: {:?}°C)", msg, cpu, gpu);
+                        self.last_logged = Some(msg.to_string());
+                    }
+                    return (cpu, gpu);
+                }
+                Err(_) => {}
+            }
+
+            // Source 1: LibreHardwareMonitor WMI
             match self.query_lhm_ns("ROOT\\LibreHardwareMonitor", false) {
                 Ok((cpu, gpu)) => {
                     let msg = "LibreHardwareMonitor WMI";
@@ -424,7 +522,7 @@ mod windows_hardware {
                 Err(_) => {}
             }
 
-            // Source 2: OpenHardwareMonitor
+            // Source 2: OpenHardwareMonitor WMI
             match self.query_lhm_ns("ROOT\\OpenHardwareMonitor", true) {
                 Ok((cpu, gpu)) => {
                     let msg = "OpenHardwareMonitor WMI";
@@ -465,7 +563,8 @@ mod windows_hardware {
 
             if self.last_logged.as_deref() != Some("None") {
                 println!("[Hardware Monitor] Aviso: No se detectó ninguna fuente de temperatura en Windows.");
-                println!("  -> Si usas Libre Hardware Monitor, ábrelo y verifica que 'Options -> WMI' esté activado.");
+                println!("  -> En Libre Hardware Monitor: ve a 'Options -> Remote Web Server' y pulsa 'Run'.");
+                println!("  -> O bien usa Open Hardware Monitor (con Options -> WMI activado).");
                 self.last_logged = Some("None".to_string());
             }
 
