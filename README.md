@@ -50,10 +50,14 @@ your-folder/
 
 - **Linux**: Temperatures are read natively out-of-the-box from standard kernel hwmon interfaces (`/sys/class/hwmon`).
 - **Windows (CPU Temperature)**:
-  - Due to Windows architecture, accessing direct CPU core/package registers (MSR) requires Ring 0 kernel privileges with signed drivers.
-  - To view accurate real-time CPU & GPU temperatures, simply have [Libre Hardware Monitor](https://librehardwaremonitor.net/) (or [Open Hardware Monitor](https://openhardwaremonitor.org/)) running in the background. It is open-source, portable (no installation needed), and can be minimized to the system tray.
-  - The backend automatically connects to the Libre Hardware Monitor WMI service to retrieve dynamic temperatures.
-  - *If Libre Hardware Monitor is not open, all other telemetry (CPU %, RAM %, GPU %, VRAM %) and the soundboard will continue to work normally.*
+  - Due to Windows NT architecture, reading direct CPU core/package registers (MSR) requires Ring 0 kernel driver privileges.
+  - To view accurate real-time CPU & GPU temperatures:
+    1. Download and launch [Libre Hardware Monitor](https://librehardwaremonitor.net/) (portable, open-source).
+    2. In Libre Hardware Monitor, enable **`Options -> Remote Web Server -> Run`** (runs locally on port 8085).
+    3. *(Optional)* Enable **`Options -> Start Minimized`** and **`Options -> Run on Windows Startup`** so it starts silently in the background.
+    4. The backend automatically connects to `http://localhost:8085/data.json` to read dynamic CPU & GPU temperatures in real time.
+  - *(Fallback)*: If you use [Open Hardware Monitor](https://openhardwaremonitor.org/), make sure **`Options -> WMI`** is checked.
+  - *If no external monitor is running, all other telemetry (CPU %, RAM %, GPU %, VRAM %) and the soundboard will continue to work normally.*
 
 ## How to Run
 
