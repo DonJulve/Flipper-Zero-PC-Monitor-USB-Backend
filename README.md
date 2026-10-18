@@ -58,6 +58,7 @@ your-folder/
     4. The backend automatically connects to `http://localhost:8085/data.json` to read dynamic CPU & GPU temperatures in real time.
   - *(Fallback)*: If you use [Open Hardware Monitor](https://openhardwaremonitor.org/), make sure **`Options -> WMI`** is checked.
   - *If no external monitor is running, all other telemetry (CPU %, RAM %, GPU %, VRAM %) and the soundboard will continue to work normally.*
+  - *You will need to run the backend as an administrator to monitor the CPU temperature.*
 
 ## How to Run
 
